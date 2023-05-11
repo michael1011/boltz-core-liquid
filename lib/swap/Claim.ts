@@ -63,8 +63,8 @@ export const constructClaimTransaction = (
   if (
     !utxos.every(
       (utxo) =>
-        (utxo.blindinkPrivKey === undefined) ===
-        (utxos[0].blindinkPrivKey === undefined),
+        (utxo.blindingPrivKey === undefined) ===
+        (utxos[0].blindingPrivKey === undefined),
     )
   ) {
     throw Errors.INCONSISTENT_BLINDING;
@@ -74,9 +74,9 @@ export const constructClaimTransaction = (
 
   const updater = new Updater(pset);
 
-  let utxoValueSum = 0;
+  let utxoValueSum = BigInt(0);
   for (const [i, utxo] of utxos.entries()) {
-    utxoValueSum += getOutputValue(utxo);
+    utxoValueSum += BigInt(getOutputValue(utxo));
 
     const txHash = Buffer.alloc(utxo.txHash.length);
     utxo.txHash.copy(txHash);
@@ -119,7 +119,7 @@ export const constructClaimTransaction = (
       script: destinationScript,
       blindingPublicKey: blindingKey,
       asset: assetHash,
-      amount: utxoValueSum - fee,
+      amount: Number(utxoValueSum - BigInt(fee)),
       blinderIndex: blindingKey !== undefined ? 0 : undefined,
     },
   ]);
@@ -133,7 +133,7 @@ export const constructClaimTransaction = (
     ]);
   };
 
-  if (utxos[0].blindinkPrivKey !== undefined) {
+  if (utxos[0].blindingPrivKey !== undefined) {
     // We have to have at least one blinded output if we are spending blinded coins,
     // so we add a small OP_RETURN
     if (blindingKey === undefined) {
@@ -219,8 +219,8 @@ export const constructClaimTransaction = (
 };
 
 const getOutputValue = (utxo: ClaimDetails): number => {
-  return utxo.blindinkPrivKey
-    ? Number(confi.unblindOutputWithKey(utxo, utxo.blindinkPrivKey).value)
+  return utxo.blindingPrivKey
+    ? Number(confi.unblindOutputWithKey(utxo, utxo.blindingPrivKey).value)
     : confidentialValueToSatoshi(utxo.value);
 };
 
@@ -228,7 +228,7 @@ const blindPset = (pset: Pset, utxos: ClaimDetails[]) => {
   const zkpGenerator = new ZKPGenerator(
     zkpLib,
     ZKPGenerator.WithBlindingKeysOfInputs(
-      utxos.map((utxo) => utxo.blindinkPrivKey!),
+      utxos.map((utxo) => utxo.blindingPrivKey!),
     ),
   );
   const zkpValidator = new ZKPValidator(zkpLib);

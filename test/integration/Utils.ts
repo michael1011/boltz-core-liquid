@@ -113,7 +113,7 @@ export const createSwapDetails = async (
         preimage,
         keys: claimKeys,
         legacyTx: out.legacyTx,
-        blindinkPrivKey: out.blindKey,
+        blindingPrivKey: out.blindKey,
         redeemScript: out.redeemScript,
         ...out.swapOutput,
       });
@@ -130,7 +130,7 @@ export const createSwapDetails = async (
     refundOutputs.forEach((out) => {
       refundDetails.push({
         keys: refundKeys,
-        blindinkPrivKey: out.blindKey,
+        blindingPrivKey: out.blindKey,
         redeemScript: out.redeemScript,
         ...out.swapOutput,
       });

@@ -20,7 +20,7 @@ export type RefundDetails = TransactionOutput & {
   keys: ECPairInterface | BIP32Interface;
   redeemScript: Buffer;
   legacyTx?: Transaction;
-  blindinkPrivKey?: Buffer;
+  blindingPrivKey?: Buffer;
 };
 
 export type ClaimDetails = RefundDetails & {

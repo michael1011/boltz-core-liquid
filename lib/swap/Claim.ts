@@ -2,17 +2,37 @@
  * This file is based on the repository github.com/submarineswaps/swaps-service created by Alex Bosworth
  */
 
-import * as bip65 from 'bip65';
 import ops from '@boltz/bitcoin-ops';
-import * as varuint from 'varuint-bitcoin';
-import { crypto, script, Transaction, networks, confidential } from 'liquidjs-lib';
+import { reverseBuffer, varuint } from 'liquidjs-lib/src/bufferutils';
+import {
+  Blinder,
+  confidential,
+  Creator,
+  CreatorInput,
+  CreatorOutput,
+  crypto,
+  Extractor,
+  Finalizer,
+  networks,
+  Pset,
+  script,
+  Signer,
+  Transaction,
+  Updater,
+  witnessStackToScriptWitness,
+  ZKPGenerator,
+  ZKPValidator,
+} from 'liquidjs-lib';
 import Errors from '../consts/Errors';
+import { getHexString } from '../Utils';
 import { OutputType } from '../consts/Enums';
 import { ClaimDetails } from '../consts/Types';
-import { Nonce, EmptyScript, PrefixUnconfidential } from '../consts/Buffer';
-import { encodeSignature, scriptBuffersToScript } from './SwapUtils';
+import { scriptBuffersToScript } from './SwapUtils';
+import { confi, ecPair, zkpLib } from '../Confidential';
 
-const { confidentialValueToSatoshi, satoshiToConfidentialValue } = confidential;
+const { confidentialValueToSatoshi } = confidential;
+
+const sighashType = Transaction.SIGHASH_ALL;
 
 /**
  * Claim swaps
@@ -21,8 +41,9 @@ const { confidentialValueToSatoshi, satoshiToConfidentialValue } = confidential;
  * @param destinationScript the output script to which the funds should be sent
  * @param fee how many satoshis should be paid as fee
  * @param isRbf whether the transaction should signal full Replace-by-Fee
- * @param timeoutBlockHeight locktime of the transaction; only needed if the transaction is a refund
  * @param assetHash asset hash of Liquid asset
+ * @param blindingKey blinding public key for the output
+ * @param timeoutBlockHeight locktime of the transaction; only needed if the transaction is a refund
  */
 export const constructClaimTransaction = (
   utxos: ClaimDetails[],
@@ -30,99 +51,198 @@ export const constructClaimTransaction = (
   fee: number,
   isRbf = true,
   assetHash: string = networks.liquid.assetHash,
+  blindingKey?: Buffer,
   timeoutBlockHeight?: number,
 ): Transaction => {
   for (const input of utxos) {
-    if (input.type === OutputType.Taproot) {
-      throw Errors.TAPROOT_NOT_SUPPORTED;
+    if (input.type !== OutputType.Bech32) {
+      throw Errors.ONLY_NATIVE_SEGWIT_INPUTS;
     }
   }
 
-  const tx = new Transaction();
-
-  // Refund transactions are just like claim ones and therefore this method
-  // is also used for refunds. The locktime of refund transactions has to be
-  // after the timelock of the UTXO is expired
-  if (timeoutBlockHeight) {
-    tx.locktime = bip65.encode({ blocks: timeoutBlockHeight });
+  if (
+    !utxos.every(
+      (utxo) =>
+        (utxo.blindingPrivKey === undefined) ===
+        (utxos[0].blindingPrivKey === undefined),
+    )
+  ) {
+    throw Errors.INCONSISTENT_BLINDING;
   }
 
-  // The sum of the values of all UTXOs that should be claimed or refunded
-  let utxoValueSum = 0;
+  const pset = Creator.newPset();
 
-  utxos.forEach((utxo) => {
-    utxoValueSum += confidentialValueToSatoshi(utxo.value);
+  const updater = new Updater(pset);
 
-    // Add the swap as input to the transaction
-    //
-    // RBF reference: https://github.com/bitcoin/bips/blob/master/bip-0125.mediawiki#summary
-    tx.addInput(utxo.txHash, utxo.vout, isRbf ? 0xfffffffd : 0xffffffff);
-  });
+  let utxoValueSum = BigInt(0);
+  for (const [i, utxo] of utxos.entries()) {
+    utxoValueSum += BigInt(getOutputValue(utxo));
 
-  const LBTC = Buffer.concat([
-    PrefixUnconfidential,
-    Buffer.from(assetHash, 'hex').reverse(),
+    const txHash = Buffer.alloc(utxo.txHash.length);
+    utxo.txHash.copy(txHash);
+    const txid = getHexString(reverseBuffer(txHash));
+
+    pset.addInput(
+      new CreatorInput(
+        txid,
+        utxo.vout,
+        isRbf ? 0xfffffffd : 0xffffffff,
+        i == 0 ? timeoutBlockHeight : undefined,
+      ).toPartialInput(),
+    );
+    updater.addInSighashType(i, sighashType);
+
+    if (utxo.type === OutputType.Legacy) {
+      updater.addInNonWitnessUtxo(i, utxo.legacyTx!);
+      updater.addInRedeemScript(i, utxo.redeemScript);
+    } else if (utxo.type === OutputType.Compatibility) {
+      updater.addInNonWitnessUtxo(i, utxo.legacyTx!);
+      updater.addInRedeemScript(
+        i,
+        scriptBuffersToScript([
+          scriptBuffersToScript([
+            varuint.encode(ops.OP_0).toString('hex'),
+            crypto.sha256(utxo.redeemScript),
+          ]),
+        ]),
+      );
+    }
+
+    if (utxo.type !== OutputType.Legacy) {
+      updater.addInWitnessUtxo(i, utxo);
+      updater.addInWitnessScript(i, utxo.redeemScript);
+    }
+  }
+
+  updater.addOutputs([
+    {
+      script: destinationScript,
+      blindingPublicKey: blindingKey,
+      asset: assetHash,
+      amount: Number(utxoValueSum - BigInt(fee)),
+      blinderIndex: blindingKey !== undefined ? 0 : undefined,
+    },
   ]);
 
-  // Send the sum of the UTXOs minus the estimated fee to the destination address
-  tx.addOutput(
-    destinationScript,
-    satoshiToConfidentialValue(utxoValueSum - fee),
-    LBTC,
-    Nonce
-  );
-  // Add explicit fee output
-  tx.addOutput(
-    EmptyScript,
-    satoshiToConfidentialValue(fee),
-    LBTC,
-    Nonce
-  );
+  const addFeeOutput = () => {
+    updater.addOutputs([
+      {
+        amount: fee,
+        asset: assetHash,
+      },
+    ]);
+  };
 
-  utxos.forEach((utxo, index) => {
-    switch (utxo.type) {
-      // Construct and sign the input scripts for P2SH inputs
-      case OutputType.Legacy: {
-        const sigHash = tx.hashForSignature(index, utxo.redeemScript, Transaction.SIGHASH_ALL);
-        const signature = utxo.keys.sign(sigHash);
+  if (utxos[0].blindingPrivKey !== undefined) {
+    // We have to have at least one blinded output if we are spending blinded coins,
+    // so we add a small OP_RETURN
+    if (blindingKey === undefined) {
+      pset.addOutput(
+        new CreatorOutput(
+          assetHash,
+          0,
+          Buffer.of(ops.OP_RETURN),
+          ecPair.makeRandom().publicKey,
+          0,
+        ).toPartialOutput(),
+      );
+    }
 
-        const inputScript = [
-          encodeSignature(Transaction.SIGHASH_ALL, signature),
+    addFeeOutput();
+
+    blindPset(pset, utxos);
+  } else {
+    addFeeOutput();
+  }
+
+  const signer = new Signer(pset);
+
+  const signatures: Buffer[] = [];
+
+  for (const [i, utxo] of utxos.entries()) {
+    const signature = script.signature.encode(
+      utxo.keys.sign(pset.getInputPreimage(i, sighashType)),
+      sighashType,
+    );
+    signatures.push(signature);
+
+    signer.addSignature(
+      i,
+      {
+        partialSig: {
+          pubkey: utxo.keys.publicKey,
+          signature,
+        },
+      },
+      Pset.ECDSASigValidator(zkpLib.ecc),
+    );
+  }
+
+  const finalizer = new Finalizer(pset);
+
+  for (const [i, utxo] of utxos.entries()) {
+    finalizer.finalizeInput(i, () => {
+      const finals: {
+        finalScriptSig?: Buffer;
+        finalScriptWitness?: Buffer;
+      } = {};
+
+      if (utxo.type === OutputType.Legacy) {
+        finals.finalScriptSig = scriptBuffersToScript([
+          signatures[i],
           utxo.preimage,
           ops.OP_PUSHDATA1,
           utxo.redeemScript,
-        ];
-
-        tx.setInputScript(index, scriptBuffersToScript(inputScript));
-        break;
+        ]);
+      } else if (utxo.type === OutputType.Compatibility) {
+        finals.finalScriptSig = scriptBuffersToScript([
+          scriptBuffersToScript([
+            varuint.encode(ops.OP_0).toString('hex'),
+            crypto.sha256(utxo.redeemScript),
+          ]),
+        ]);
       }
 
-      // Construct the nested redeem script for nested SegWit inputs
-      case OutputType.Compatibility: {
-        const nestedScript = [
-          varuint.encode(ops.OP_0).toString('hex'),
-          crypto.sha256(utxo.redeemScript),
-        ];
-
-        const nested = scriptBuffersToScript(nestedScript);
-
-        tx.setInputScript(index, scriptBuffersToScript([ nested ]));
-        break;
+      if (utxo.type !== OutputType.Legacy) {
+        finals.finalScriptWitness = witnessStackToScriptWitness([
+          signatures[i],
+          utxo.preimage,
+          utxo.redeemScript,
+        ]);
       }
-    }
 
-    // Construct and sign the witness for (nested) SegWit inputs
-    if (utxo.type !== OutputType.Legacy) {
-      const sigHash = tx.hashForWitnessV0(index, utxo.redeemScript, utxo.value, Transaction.SIGHASH_ALL);
-      const signature = script.signature.encode(utxo.keys.sign(sigHash), Transaction.SIGHASH_ALL);
+      return finals;
+    });
+  }
 
-      tx.setWitness(index, [
-        signature,
-        utxo.preimage,
-        utxo.redeemScript,
-      ]);
-    }
-  });
+  return Extractor.extract(pset);
+};
 
-  return tx;
+const getOutputValue = (utxo: ClaimDetails): number => {
+  return utxo.blindingPrivKey
+    ? Number(confi.unblindOutputWithKey(utxo, utxo.blindingPrivKey).value)
+    : confidentialValueToSatoshi(utxo.value);
+};
+
+const blindPset = (pset: Pset, utxos: ClaimDetails[]) => {
+  const zkpGenerator = new ZKPGenerator(
+    zkpLib,
+    ZKPGenerator.WithBlindingKeysOfInputs(
+      utxos.map((utxo) => utxo.blindingPrivKey!),
+    ),
+  );
+  const zkpValidator = new ZKPValidator(zkpLib);
+  const outputBlindingArgs = zkpGenerator.blindOutputs(
+    pset,
+    Pset.ECCKeysGenerator(zkpLib.ecc),
+  );
+
+  const blinder = new Blinder(
+    pset,
+    zkpGenerator.unblindInputs(pset),
+    zkpValidator,
+    zkpGenerator,
+  );
+
+  blinder.blindLast({ outputBlindingArgs });
 };
